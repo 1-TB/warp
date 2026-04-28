@@ -2248,9 +2248,17 @@ impl RootView {
                 // settings need an account (AI or Warp Drive enabled).
                 let ai_enabled = selected_settings.is_ai_enabled();
                 let warp_drive_enabled = selected_settings.is_warp_drive_enabled();
+                // Local-mode escape hatch: if the user has configured a local
+                // OpenAI-compatible endpoint (via settings or the
+                // WARP_LOCAL_AI_ENDPOINT env var), AI requests stay on-device
+                // and a Warp account isn't needed for the AI path. Warp Drive
+                // still requires a real account.
+                let local_ai_configured =
+                    ai::local_provider::is_locally_configured(ai::api_keys::ApiKeyManager::as_ref(ctx).keys());
+                let ai_needs_login = ai_enabled && !local_ai_configured;
                 // With old onboarding, we ask user to log in before onboarding, so don't do it after onboarding completes.
                 let requires_login = !is_logged_in
-                    && (ai_enabled || warp_drive_enabled)
+                    && (ai_needs_login || warp_drive_enabled)
                     && FeatureFlag::OpenWarpNewSettingsModes.is_enabled();
 
                 if requires_login {

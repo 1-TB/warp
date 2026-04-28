@@ -31,6 +31,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::api_keys::ApiKeys;
 
+/// Environment variable that, when set to a non-empty URL, supplies the
+/// local OpenAI-compatible endpoint without the user having to open the
+/// settings UI. Solves the chicken-and-egg of "I need to sign in to
+/// reach settings to configure local mode to skip sign-in".
+pub const LOCAL_ENDPOINT_ENV: &str = "WARP_LOCAL_AI_ENDPOINT";
+/// Companion to [`LOCAL_ENDPOINT_ENV`]. If set, used as the model name.
+pub const LOCAL_MODEL_ENV: &str = "WARP_LOCAL_AI_MODEL";
+/// Optional bearer token for the local endpoint.
+pub const LOCAL_API_KEY_ENV: &str = "WARP_LOCAL_AI_API_KEY";
+
 /// Resolved configuration for talking to a user's local OpenAI-compatible
 /// endpoint. Built from [`ApiKeys`] at request time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,20 +58,55 @@ impl LocalEndpointConfig {
     /// Builds a config from the user's stored [`ApiKeys`], or returns
     /// `None` if either the endpoint URL or model name is missing.
     pub fn from_api_keys(keys: &ApiKeys) -> Option<Self> {
-        let base_url = keys.local_endpoint.as_ref()?.trim().trim_end_matches('/');
+        Self::build(
+            keys.local_endpoint.as_deref(),
+            keys.local_model.as_deref(),
+            keys.local_api_key.as_deref(),
+        )
+    }
+
+    /// Builds a config from environment variables only, ignoring stored
+    /// keys. Useful at boot time to skip the sign-in wall before any
+    /// settings UI is reachable.
+    pub fn from_env() -> Option<Self> {
+        Self::build(
+            std::env::var(LOCAL_ENDPOINT_ENV).ok().as_deref(),
+            std::env::var(LOCAL_MODEL_ENV).ok().as_deref(),
+            std::env::var(LOCAL_API_KEY_ENV).ok().as_deref(),
+        )
+    }
+
+    /// Builds a config preferring env vars when present, falling back to
+    /// stored [`ApiKeys`]. The env vars override individual fields, so a
+    /// user can pin just the URL via env and leave the model in settings.
+    pub fn from_env_or_keys(keys: &ApiKeys) -> Option<Self> {
+        let endpoint_env = std::env::var(LOCAL_ENDPOINT_ENV).ok();
+        let model_env = std::env::var(LOCAL_MODEL_ENV).ok();
+        let api_key_env = std::env::var(LOCAL_API_KEY_ENV).ok();
+        Self::build(
+            endpoint_env.as_deref().or(keys.local_endpoint.as_deref()),
+            model_env.as_deref().or(keys.local_model.as_deref()),
+            api_key_env.as_deref().or(keys.local_api_key.as_deref()),
+        )
+    }
+
+    fn build(
+        base_url: Option<&str>,
+        model: Option<&str>,
+        api_key: Option<&str>,
+    ) -> Option<Self> {
+        let base_url = base_url?.trim().trim_end_matches('/');
         if base_url.is_empty() {
             return None;
         }
-        let model = keys.local_model.as_ref()?.trim();
+        let model = model?.trim();
         if model.is_empty() {
             return None;
         }
         Some(Self {
             base_url: base_url.to_string(),
             model: model.to_string(),
-            api_key: keys
-                .local_api_key
-                .as_ref()
+            api_key: api_key
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
         })
@@ -71,6 +116,12 @@ impl LocalEndpointConfig {
     pub fn chat_completions_url(&self) -> String {
         format!("{}/chat/completions", self.base_url)
     }
+}
+
+/// Cheap check used by UI gating code: is local mode configured *somewhere*
+/// (env or stored keys)? Avoids cloning [`ApiKeys`] just to inspect it.
+pub fn is_locally_configured(keys: &ApiKeys) -> bool {
+    LocalEndpointConfig::from_env_or_keys(keys).is_some()
 }
 
 /// Errors returned from the local dispatcher. Stage 2 will extend this with
@@ -188,5 +239,33 @@ mod tests {
         assert!(keys.has_local_endpoint());
         keys.local_endpoint = Some("   ".into());
         assert!(!keys.has_local_endpoint());
+    }
+
+    #[test]
+    fn build_directly_with_blank_url_returns_none() {
+        assert!(LocalEndpointConfig::build(Some(""), Some("m"), None).is_none());
+        assert!(LocalEndpointConfig::build(Some("   "), Some("m"), None).is_none());
+        assert!(LocalEndpointConfig::build(None, Some("m"), None).is_none());
+    }
+
+    #[test]
+    fn build_directly_with_blank_model_returns_none() {
+        assert!(LocalEndpointConfig::build(Some("http://x"), Some(""), None).is_none());
+        assert!(LocalEndpointConfig::build(Some("http://x"), None, None).is_none());
+    }
+
+    #[test]
+    fn is_locally_configured_reflects_keys() {
+        let mut keys = ApiKeys::default();
+        // is_locally_configured reads env vars too, but in a clean test
+        // process they're unset, so this just exercises the keys path.
+        assert!(!is_locally_configured(&keys));
+        keys.local_endpoint = Some("http://localhost:11434/v1".into());
+        keys.local_model = Some("m".into());
+        // Note: this assertion can be flaky if the test runner has the env
+        // vars set. We accept that risk since we don't mutate env in tests.
+        if std::env::var(LOCAL_ENDPOINT_ENV).is_err() {
+            assert!(is_locally_configured(&keys));
+        }
     }
 }

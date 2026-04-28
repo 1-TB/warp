@@ -243,7 +243,7 @@ impl RequestParams {
             user_workspaces.is_aws_bedrock_credentials_enabled(app),
         );
         let local_endpoint =
-            ai::local_provider::LocalEndpointConfig::from_api_keys(api_key_manager.keys());
+            ai::local_provider::LocalEndpointConfig::from_env_or_keys(api_key_manager.keys());
         let allow_use_of_warp_credits_with_byok =
             *AISettings::as_ref(app).can_use_warp_credits_with_byok;
 
