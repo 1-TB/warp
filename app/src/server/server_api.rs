@@ -3,6 +3,7 @@ pub mod auth;
 pub mod block;
 pub mod harness_support;
 pub mod integrations;
+pub mod local_dispatch;
 pub mod managed_secrets;
 pub mod object;
 pub(crate) mod presigned_upload;

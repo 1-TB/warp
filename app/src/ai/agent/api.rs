@@ -115,6 +115,10 @@ pub struct RequestParams {
 
     /// User-provided API keys for AI providers (BYO API Key).
     pub api_keys: Option<warp_multi_agent_api::request::settings::ApiKeys>,
+    /// Resolved local OpenAI-compatible endpoint config, if the user has
+    /// configured one. When `Some`, the dispatcher routes the request to
+    /// the local endpoint instead of the Warp GraphQL backend.
+    pub local_endpoint: Option<ai::local_provider::LocalEndpointConfig>,
     pub allow_use_of_warp_credits_with_byok: bool,
     pub autonomy_level: warp_multi_agent_api::AutonomyLevel,
     pub isolation_level: warp_multi_agent_api::IsolationLevel,
@@ -233,10 +237,13 @@ impl RequestParams {
         let should_redact_secrets = get_secret_obfuscation_mode(app).should_redact_secret();
 
         let user_workspaces = UserWorkspaces::as_ref(app);
-        let api_keys = ApiKeyManager::as_ref(app).api_keys_for_request(
+        let api_key_manager = ApiKeyManager::as_ref(app);
+        let api_keys = api_key_manager.api_keys_for_request(
             user_workspaces.is_byo_api_key_enabled(),
             user_workspaces.is_aws_bedrock_credentials_enabled(app),
         );
+        let local_endpoint =
+            ai::local_provider::LocalEndpointConfig::from_api_keys(api_key_manager.keys());
         let allow_use_of_warp_credits_with_byok =
             *AISettings::as_ref(app).can_use_warp_credits_with_byok;
 
@@ -298,6 +305,7 @@ impl RequestParams {
             planning_enabled: true,
             should_redact_secrets,
             api_keys,
+            local_endpoint,
             allow_use_of_warp_credits_with_byok,
             autonomy_level,
             isolation_level,

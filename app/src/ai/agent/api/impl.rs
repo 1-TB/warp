@@ -51,6 +51,7 @@ pub async fn generate_multi_agent_output(
         redaction::redact_inputs(&mut params.input);
     }
 
+    let local_endpoint = params.local_endpoint.take();
     let mut api_keys = params.api_keys;
     if let Some(api_keys) = &mut api_keys {
         api_keys.allow_use_of_warp_credits = params.allow_use_of_warp_credits_with_byok;
@@ -129,7 +130,21 @@ pub async fn generate_multi_agent_output(
         mcp_context: params.mcp_context.map(Into::into),
     };
 
-    let response_stream = server_api.generate_multi_agent_output(&request).await;
+    // Local OpenAI-compatible endpoint takes precedence over the Warp
+    // backend. The user opts in by configuring a URL + model name in
+    // settings; a populated `local_endpoint` here means they did. Tools,
+    // streaming text deltas, and attachments are not yet supported in
+    // local mode (Stage 2 only handles plain text round-trips).
+    let response_stream = if let Some(local_endpoint) = local_endpoint.clone() {
+        crate::server::server_api::local_dispatch::dispatch_local(
+            server_api.http_client(),
+            &request,
+            local_endpoint,
+        )
+        .await
+    } else {
+        server_api.generate_multi_agent_output(&request).await
+    };
     match response_stream {
         Ok(stream) => {
             let output_stream = stream.take_until(cancellation_rx);
