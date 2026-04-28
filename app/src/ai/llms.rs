@@ -36,6 +36,12 @@ pub fn is_using_api_key_for_provider(provider: &LLMProvider, app: &AppContext) -
         LLMProvider::OpenAI => api_keys.is_some_and(|keys| keys.openai.is_some()),
         LLMProvider::Anthropic => api_keys.is_some_and(|keys| keys.anthropic.is_some()),
         LLMProvider::Google => api_keys.is_some_and(|keys| keys.google.is_some()),
+        LLMProvider::Local => {
+            // Always rely on the user's local endpoint regardless of the BYOK
+            // workspace setting — local mode is opt-in via configuring an
+            // endpoint URL, not via the workspace flag.
+            ApiKeyManager::as_ref(app).keys().has_local_endpoint()
+        }
         _ => false,
     }
 }
@@ -89,6 +95,10 @@ pub enum LLMProvider {
     Anthropic,
     Google,
     Xai,
+    /// User-configured OpenAI-compatible endpoint (Ollama, LM Studio,
+    /// llama.cpp server, vLLM, etc.). Routed entirely on the client; no
+    /// requests leave the machine unless the user points at a remote URL.
+    Local,
     Unknown,
 }
 
@@ -100,6 +110,7 @@ impl LLMProvider {
             LLMProvider::Anthropic => Some(Icon::ClaudeLogo),
             LLMProvider::Google => Some(Icon::GeminiLogo),
             LLMProvider::Xai => None,
+            LLMProvider::Local => None,
             LLMProvider::Unknown => None,
         }
     }

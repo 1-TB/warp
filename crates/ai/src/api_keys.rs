@@ -22,6 +22,19 @@ pub struct ApiKeys {
     pub anthropic: Option<String>,
     pub openai: Option<String>,
     pub open_router: Option<String>,
+    /// Base URL of an OpenAI-compatible endpoint (e.g. `http://localhost:11434/v1`
+    /// for Ollama, or any LM Studio / llama.cpp / vLLM instance). When set,
+    /// agent requests can be routed locally without contacting Warp's servers.
+    #[serde(default)]
+    pub local_endpoint: Option<String>,
+    /// Model name to send to the local endpoint (e.g. `qwen2.5-coder:7b`).
+    #[serde(default)]
+    pub local_model: Option<String>,
+    /// Optional bearer token for the local endpoint. Most local runtimes
+    /// (Ollama, LM Studio) ignore this; vLLM / hosted OpenAI-compatible
+    /// gateways may require it.
+    #[serde(default)]
+    pub local_api_key: Option<String>,
 }
 
 impl ApiKeys {
@@ -30,6 +43,14 @@ impl ApiKeys {
             || self.anthropic.is_some()
             || self.google.is_some()
             || self.open_router.is_some()
+            || self.local_endpoint.is_some()
+    }
+
+    /// Returns true if a local OpenAI-compatible endpoint has been configured.
+    pub fn has_local_endpoint(&self) -> bool {
+        self.local_endpoint
+            .as_ref()
+            .is_some_and(|url| !url.trim().is_empty())
     }
 }
 
@@ -89,6 +110,24 @@ impl ApiKeyManager {
 
     pub fn set_open_router_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
         self.keys.open_router = key;
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_endpoint(&mut self, endpoint: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.local_endpoint = endpoint.filter(|s| !s.trim().is_empty());
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_model(&mut self, model: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.local_model = model.filter(|s| !s.trim().is_empty());
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_api_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.local_api_key = key.filter(|s| !s.trim().is_empty());
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }

@@ -5803,6 +5803,10 @@ struct ApiKeysWidget {
     anthropic_api_key_editor: ViewHandle<EditorView>,
     google_api_key_editor: ViewHandle<EditorView>,
 
+    local_endpoint_editor: ViewHandle<EditorView>,
+    local_model_editor: ViewHandle<EditorView>,
+    local_api_key_editor: ViewHandle<EditorView>,
+
     can_use_warp_credits_with_byok: SwitchStateHandle,
     upgrade_highlight_index: HighlightedHyperlink,
 }
@@ -5818,6 +5822,9 @@ impl ApiKeysWidget {
             openai: openai_key,
             anthropic: anthropic_key,
             google: google_key,
+            local_endpoint,
+            local_model,
+            local_api_key,
             ..
         } = ApiKeyManager::as_ref(ctx).keys().clone();
 
@@ -5906,14 +5913,164 @@ impl ApiKeysWidget {
             "AIzaSy..."
         );
 
+        // Local OpenAI-compatible endpoint editors. Unlike the BYOK fields above
+        // these are always editable when AI is enabled — local mode does not
+        // require the workspace BYOK flag, since no Warp credits are involved.
+        macro_rules! create_local_editor {
+            ($editor:ident, $initial:ident, $set_func:ident, $placeholder:literal, $is_password:expr) => {
+                let $editor = ctx.add_typed_action_view(move |ctx| {
+                    let appearance = Appearance::handle(ctx).as_ref(ctx);
+                    let options = SingleLineEditorOptions {
+                        is_password: $is_password,
+                        text: TextOptions {
+                            font_size_override: Some(appearance.ui_font_size()),
+                            font_family_override: Some(appearance.monospace_font_family()),
+                            text_colors_override: Some(TextColors {
+                                default_color: appearance.theme().active_ui_text_color(),
+                                disabled_color: appearance.theme().disabled_ui_text_color(),
+                                hint_color: appearance.theme().disabled_ui_text_color(),
+                            }),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let mut editor = EditorView::single_line(options, ctx);
+                    editor.set_placeholder_text($placeholder, ctx);
+                    if let Some(value) = &$initial {
+                        editor.set_buffer_text(value, ctx);
+                    }
+                    editor
+                });
+                AISettingsPageView::update_editor_interaction_state(
+                    $editor.clone(),
+                    is_any_ai_enabled,
+                    ctx,
+                );
+                ctx.subscribe_to_view(&$editor, |_, $editor, event, ctx| {
+                    if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                        let buffer_text = $editor.as_ref(ctx).buffer_text(ctx);
+                        let value = buffer_text.trim().is_empty().not().then_some(buffer_text);
+                        ApiKeyManager::handle(ctx).update(ctx, |model, ctx| {
+                            model.$set_func(value, ctx);
+                        });
+                    }
+                });
+            };
+        }
+
+        create_local_editor!(
+            local_endpoint_editor,
+            local_endpoint,
+            set_local_endpoint,
+            "http://localhost:11434/v1",
+            false
+        );
+        create_local_editor!(
+            local_model_editor,
+            local_model,
+            set_local_model,
+            "qwen2.5-coder:7b",
+            false
+        );
+        create_local_editor!(
+            local_api_key_editor,
+            local_api_key,
+            set_local_api_key,
+            "(optional)",
+            true
+        );
+
         Self {
             openai_api_key_editor,
             anthropic_api_key_editor,
             google_api_key_editor,
 
+            local_endpoint_editor,
+            local_model_editor,
+            local_api_key_editor,
+
             can_use_warp_credits_with_byok: Default::default(),
             upgrade_highlight_index: Default::default(),
         }
+    }
+
+    fn render_local_endpoint_section(
+        &self,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let ai_settings = AISettings::as_ref(app);
+        let is_enabled = ai_settings.is_any_ai_enabled(app);
+
+        let mut column = Flex::column()
+            .with_spacing(16.)
+            .with_child(
+                Container::new(render_ai_setting_description(
+                    "Route agent requests to a local OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp server, vLLM, etc.). When an endpoint URL is set, agent traffic stays on your machine and does not require a Warp account. Tool-calling fidelity depends on the model — Qwen2.5-Coder, Llama 3.1 Instruct, and GPT-OSS are good starting points.",
+                    is_enabled,
+                    app,
+                ))
+                .with_margin_bottom(-styles::DESCRIPTION_MARGIN_BOTTOM)
+                .finish(),
+            );
+
+        fn render_input(
+            appearance: &Appearance,
+            label: &'static str,
+            editor: ViewHandle<EditorView>,
+            is_enabled: bool,
+            app: &AppContext,
+        ) -> Box<dyn Element> {
+            let padding = Some(Coords {
+                top: 10.,
+                bottom: 10.,
+                left: 16.,
+                right: 16.,
+            });
+            let editor_style = UiComponentStyles {
+                padding,
+                background: Some(appearance.theme().surface_2().into()),
+                ..Default::default()
+            };
+            let label = Text::new_inline(label, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                .with_color(styles::header_font_color(is_enabled, app).into())
+                .finish();
+            let input = appearance
+                .ui_builder()
+                .text_input(editor)
+                .with_style(editor_style)
+                .build()
+                .finish();
+            Flex::column()
+                .with_spacing(8.)
+                .with_child(label)
+                .with_child(input)
+                .finish()
+        }
+
+        column.add_child(render_input(
+            appearance,
+            "Endpoint URL",
+            self.local_endpoint_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_input(
+            appearance,
+            "Model name",
+            self.local_model_editor.clone(),
+            is_enabled,
+            app,
+        ));
+        column.add_child(render_input(
+            appearance,
+            "API key (optional)",
+            self.local_api_key_editor.clone(),
+            is_enabled,
+            app,
+        ));
+
+        column.finish()
     }
 
     fn render_api_keys_section(
@@ -6097,7 +6254,7 @@ impl SettingsWidget for ApiKeysWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "api keys bring your own byo openai anthropic google claude gemini gpt"
+        "api keys bring your own byo openai anthropic google claude gemini gpt local ollama llama lm studio vllm offline endpoint"
     }
 
     fn render(
@@ -6130,6 +6287,25 @@ impl SettingsWidget for ApiKeysWidget {
                     .finish(),
             );
         }
+
+        // Local OpenAI-compatible endpoint section. Always rendered — it is
+        // gated only by the "AI enabled" master toggle, not by the BYOK
+        // workspace flag, since local mode does not consume Warp credits.
+        column.add_child(
+            Container::new(render_separator(appearance))
+                .with_margin_top(16.)
+                .finish(),
+        );
+        column.add_child(
+            build_sub_header(
+                appearance,
+                "Local Model",
+                Some(styles::header_font_color(is_any_ai_enabled, app)),
+            )
+            .with_padding_bottom(HEADER_PADDING)
+            .finish(),
+        );
+        column.add_child(self.render_local_endpoint_section(appearance, app));
 
         Container::new(column.finish())
             .with_margin_bottom(HEADER_PADDING)
