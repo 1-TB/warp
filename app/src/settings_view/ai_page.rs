@@ -6006,7 +6006,12 @@ impl ApiKeysWidget {
             .with_spacing(16.)
             .with_child(
                 Container::new(render_ai_setting_description(
-                    "Route agent requests to a local OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp server, vLLM, etc.). When an endpoint URL is set, agent traffic stays on your machine and does not require a Warp account. Tool-calling fidelity depends on the model — Qwen2.5-Coder, Llama 3.1 Instruct, and GPT-OSS are good starting points.",
+                    "Route agent requests to a local OpenAI-compatible endpoint. \
+                     When an endpoint is set, agent traffic stays on your machine \
+                     and a Warp account is not required. Tool calling \
+                     (run_shell_command, read_files, grep, file_glob, \
+                     apply_file_diffs) is supported on models that implement \
+                     OpenAI-style tool calling.",
                     is_enabled,
                     app,
                 ))
@@ -6014,10 +6019,14 @@ impl ApiKeysWidget {
                 .finish(),
             );
 
+        // Renders an editor row with a label above and a small muted hint
+        // line below — used to give per-field guidance for the local model
+        // configuration without cluttering placeholder text.
         fn render_input(
             appearance: &Appearance,
             label: &'static str,
             editor: ViewHandle<EditorView>,
+            hint: &'static str,
             is_enabled: bool,
             app: &AppContext,
         ) -> Box<dyn Element> {
@@ -6041,10 +6050,13 @@ impl ApiKeysWidget {
                 .with_style(editor_style)
                 .build()
                 .finish();
+            let hint_element = render_ai_setting_description(hint, is_enabled, app);
+
             Flex::column()
                 .with_spacing(8.)
                 .with_child(label)
                 .with_child(input)
+                .with_child(hint_element)
                 .finish()
         }
 
@@ -6052,6 +6064,10 @@ impl ApiKeysWidget {
             appearance,
             "Endpoint URL",
             self.local_endpoint_editor.clone(),
+            "Examples: Ollama \u{2192} http://localhost:11434/v1 \u{00B7} \
+             LM Studio \u{2192} http://localhost:1234/v1 \u{00B7} \
+             llama.cpp server \u{2192} http://localhost:8080/v1 \u{00B7} \
+             vLLM \u{2192} http://localhost:8000/v1",
             is_enabled,
             app,
         ));
@@ -6059,6 +6075,9 @@ impl ApiKeysWidget {
             appearance,
             "Model name",
             self.local_model_editor.clone(),
+            "Models with strong tool-calling: qwen2.5-coder:7b, \
+             llama-3.1-8b-instruct, gpt-oss:20b. Smaller / older models often \
+             ignore tool definitions and reply in plain text.",
             is_enabled,
             app,
         ));
@@ -6066,9 +6085,26 @@ impl ApiKeysWidget {
             appearance,
             "API key (optional)",
             self.local_api_key_editor.clone(),
+            "Leave blank for Ollama / LM Studio / llama.cpp. Required for \
+             vLLM, hosted OpenAI-compatible gateways, and any endpoint that \
+             enforces bearer-token auth.",
             is_enabled,
             app,
         ));
+
+        // Final note: the env-var bootstrap path is covered separately, so
+        // users who don't want to open settings know the option exists.
+        column.add_child(
+            Container::new(render_ai_setting_description(
+                "Tip: WARP_LOCAL_AI_ENDPOINT, WARP_LOCAL_AI_MODEL, and \
+                 WARP_LOCAL_AI_API_KEY environment variables override these \
+                 fields and let you skip Warp sign-in on first launch.",
+                is_enabled,
+                app,
+            ))
+            .with_margin_top(8.)
+            .finish(),
+        );
 
         column.finish()
     }
