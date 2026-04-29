@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use futures::stream::StreamExt;
 use prost_types::Timestamp;
 use uuid::Uuid;
@@ -124,7 +124,7 @@ pub fn translate_request(
         model: config.model.clone(),
         messages,
         temperature: None,
-        stream: Some(false),
+        stream: Some(true),
         tools: None,
     })
 }
@@ -210,25 +210,6 @@ fn build_finished_event(reason: api::response_event::stream_finished::Reason) ->
     }
 }
 
-/// Build the `Message` carrying the assistant's full text reply.
-fn build_agent_output_message(
-    text: String,
-    task_id: String,
-    request_id: String,
-) -> api::Message {
-    api::Message {
-        id: Uuid::new_v4().to_string(),
-        task_id,
-        request_id,
-        server_message_data: String::new(),
-        citations: vec![],
-        timestamp: Some(now_timestamp()),
-        message: Some(api::message::Message::AgentOutput(
-            api::message::AgentOutput { text },
-        )),
-    }
-}
-
 fn now_timestamp() -> Timestamp {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -268,79 +249,53 @@ pub async fn dispatch_local(
     // `Metadata` only carries `conversation_id`; the request id is normally
     // generated server-side, so we mint one here.
     let request_id = Uuid::new_v4().to_string();
-
     let init = build_init_event(request, &request_id);
 
-    // Run the HTTP exchange to completion before constructing the output
-    // stream. v1 of local mode is non-streaming (`stream: false`); the
-    // entire reply is buffered, so awaiting up front keeps lifetimes simple
-    // and lets the resulting stream be `'static`.
+    // Stream the response. Each OpenAI SSE chunk maps to 0+ Warp
+    // ResponseEvents:
+    //
+    //   * The first chunk with content emits StreamInit + an
+    //     AddMessagesToTask containing an empty AgentOutput placeholder
+    //     (so the UI has a message to append into).
+    //   * Each subsequent content delta emits an AppendToMessageContent
+    //     that the existing client machinery uses to grow the rendered
+    //     text live.
+    //   * The first chunk carrying `finish_reason` (or the upstream
+    //     [DONE] / EOF) emits StreamFinished(Done).
+    //
+    // Errors during the HTTP exchange become a single
+    // StreamFinished(InternalError) event so the UI displays them inline.
     let url = config.chat_completions_url();
     let mut builder = client.post(url).json(&chat_request);
     if let Some(token) = config.api_key.as_deref() {
         builder = builder.bearer_auth(token);
     }
+    let eventsource = builder.eventsource();
 
-    let exchange_result = async {
-        let response = builder
-            .send()
-            .await
-            .context("POST to local endpoint failed")?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("reading local endpoint response body")?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "local endpoint returned status {status}: {}",
-                truncate_for_log(&body, 512)
-            ));
-        }
-        let parsed: OpenAiChatResponse = serde_json::from_str(&body).with_context(|| {
-            format!(
-                "decoding local endpoint response: {}",
-                truncate_for_log(&body, 512)
-            )
-        })?;
-        parsed
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message.content)
-            .ok_or_else(|| anyhow!("local endpoint returned no choices"))
-    }
-    .await;
-
-    let events: Vec<ResponseEvent> = match exchange_result {
-        Ok(text) => {
-            let message = build_agent_output_message(text, task_id, request_id);
-            let add_msg = wrap_action(api::client_action::Action::AddMessagesToTask(
-                api::client_action::AddMessagesToTask {
-                    task_id: message.task_id.clone(),
-                    messages: vec![message],
-                },
-            ));
-            let finished = build_finished_event(
-                api::response_event::stream_finished::Reason::Done(
-                    api::response_event::stream_finished::Done {},
-                ),
-            );
-            vec![init, add_msg, finished]
-        }
-        Err(err) => {
-            let message = format!("local endpoint error: {err:#}");
-            let finished = build_finished_event(
-                api::response_event::stream_finished::Reason::InternalError(
-                    api::response_event::stream_finished::InternalError { message },
-                ),
-            );
-            vec![init, finished]
-        }
+    let placeholder_message_id = Uuid::new_v4().to_string();
+    let init_state = StreamingState {
+        eventsource,
+        task_id,
+        request_id,
+        message_id: placeholder_message_id,
+        emitted_init: false,
+        emitted_placeholder: false,
+        finished: false,
+        pending_init: Some(init),
     };
 
-    let stream = futures::stream::iter(events)
-        .map(|event| Ok::<_, Arc<AIApiError>>(event));
+    let stream = futures::stream::unfold(Some(init_state), |state| async move {
+        let mut state = state?;
+        if state.finished {
+            return None;
+        }
+        let events = state.next_events().await;
+        // If next_events flagged us finished, the next poll will stop;
+        // otherwise we recycle the same state.
+        Some((events, Some(state)))
+    })
+    .flat_map(futures::stream::iter)
+    .map(|event| Ok::<_, Arc<AIApiError>>(event));
 
     cfg_if::cfg_if! {
         if #[cfg(target_family = "wasm")] {
@@ -348,6 +303,187 @@ pub async fn dispatch_local(
         } else {
             Ok(stream.boxed())
         }
+    }
+}
+
+/// State carried through the streaming pipeline. Held inside
+/// `stream::unfold` between chunks of the OpenAI SSE stream.
+struct StreamingState {
+    eventsource: http_client::EventSourceStream,
+    task_id: String,
+    request_id: String,
+    /// ID of the placeholder assistant message we emit on first content
+    /// chunk; subsequent deltas append into it via FieldMask.
+    message_id: String,
+    emitted_init: bool,
+    emitted_placeholder: bool,
+    finished: bool,
+    /// The pre-built StreamInit event, taken on first emission.
+    pending_init: Option<ResponseEvent>,
+}
+
+impl StreamingState {
+    /// Pulls one SSE chunk and returns the Warp `ResponseEvent`s it
+    /// produces (possibly empty, e.g. for `Event::Open` or empty deltas).
+    async fn next_events(&mut self) -> Vec<ResponseEvent> {
+        use futures::StreamExt as _;
+
+        let mut events = Vec::new();
+        let chunk = self.eventsource.next().await;
+        match chunk {
+            None => {
+                // Upstream EOF without a finish_reason. Treat as Done.
+                self.maybe_push_init(&mut events);
+                if !self.finished {
+                    events.push(self.done_event());
+                    self.finished = true;
+                }
+            }
+            Some(Ok(reqwest_eventsource::Event::Open)) => {
+                // Connection established; nothing user-visible yet.
+            }
+            Some(Ok(reqwest_eventsource::Event::Message(message))) => {
+                let data = message.data.trim();
+                if data == "[DONE]" {
+                    self.maybe_push_init(&mut events);
+                    if !self.finished {
+                        events.push(self.done_event());
+                        self.finished = true;
+                    }
+                    return events;
+                }
+                match serde_json::from_str::<OpenAiStreamChunk>(data) {
+                    Ok(chunk) => self.process_chunk(chunk, &mut events),
+                    Err(e) => {
+                        // Best-effort: drop malformed chunks but log so
+                        // diagnosis is possible. A single bad frame
+                        // shouldn't kill the whole stream.
+                        log::warn!(
+                            "local endpoint sent unparseable SSE frame: {e}; data={}",
+                            truncate_for_log(data, 256)
+                        );
+                    }
+                }
+            }
+            Some(Err(err)) => {
+                self.maybe_push_init(&mut events);
+                if !self.finished {
+                    let message = format!("local endpoint stream error: {err}");
+                    events.push(build_finished_event(
+                        api::response_event::stream_finished::Reason::InternalError(
+                            api::response_event::stream_finished::InternalError { message },
+                        ),
+                    ));
+                    self.finished = true;
+                }
+            }
+        }
+        events
+    }
+
+    fn process_chunk(&mut self, chunk: OpenAiStreamChunk, events: &mut Vec<ResponseEvent>) {
+        let Some(choice) = chunk.choices.into_iter().next() else {
+            return;
+        };
+        let delta_content = choice.delta.content.unwrap_or_default();
+        let has_content = !delta_content.is_empty();
+        let finish = choice.finish_reason;
+
+        if has_content {
+            self.maybe_push_init(events);
+            self.maybe_push_placeholder(events);
+            events.push(self.append_text_event(&delta_content));
+        }
+
+        if let Some(reason) = finish {
+            self.maybe_push_init(events);
+            // If we never emitted a placeholder (zero-content reply),
+            // emit one with empty text so the UI has something to render
+            // — otherwise the assistant turn is invisible.
+            self.maybe_push_placeholder(events);
+            if !self.finished {
+                events.push(match reason.as_str() {
+                    "length" => build_finished_event(
+                        api::response_event::stream_finished::Reason::MaxTokenLimit(
+                            api::response_event::stream_finished::ReachedMaxTokenLimit {},
+                        ),
+                    ),
+                    _ => self.done_event(),
+                });
+                self.finished = true;
+            }
+        }
+    }
+
+    fn maybe_push_init(&mut self, events: &mut Vec<ResponseEvent>) {
+        if !self.emitted_init {
+            if let Some(init) = self.pending_init.take() {
+                events.push(init);
+            }
+            self.emitted_init = true;
+        }
+    }
+
+    fn maybe_push_placeholder(&mut self, events: &mut Vec<ResponseEvent>) {
+        if self.emitted_placeholder {
+            return;
+        }
+        let placeholder = api::Message {
+            id: self.message_id.clone(),
+            task_id: self.task_id.clone(),
+            request_id: self.request_id.clone(),
+            server_message_data: String::new(),
+            citations: vec![],
+            timestamp: Some(now_timestamp()),
+            message: Some(api::message::Message::AgentOutput(
+                api::message::AgentOutput {
+                    text: String::new(),
+                },
+            )),
+        };
+        events.push(wrap_action(
+            api::client_action::Action::AddMessagesToTask(
+                api::client_action::AddMessagesToTask {
+                    task_id: self.task_id.clone(),
+                    messages: vec![placeholder],
+                },
+            ),
+        ));
+        self.emitted_placeholder = true;
+    }
+
+    /// Builds an `AppendToMessageContent` that grows the placeholder
+    /// `AgentOutput.text` by `delta`. The mask path matches the proto
+    /// field path used elsewhere in the codebase for streamed text.
+    fn append_text_event(&self, delta: &str) -> ResponseEvent {
+        let delta_message = api::Message {
+            id: self.message_id.clone(),
+            task_id: self.task_id.clone(),
+            request_id: self.request_id.clone(),
+            server_message_data: String::new(),
+            citations: vec![],
+            timestamp: None,
+            message: Some(api::message::Message::AgentOutput(
+                api::message::AgentOutput {
+                    text: delta.to_string(),
+                },
+            )),
+        };
+        wrap_action(api::client_action::Action::AppendToMessageContent(
+            api::client_action::AppendToMessageContent {
+                task_id: self.task_id.clone(),
+                message: Some(delta_message),
+                mask: Some(prost_types::FieldMask {
+                    paths: vec!["message.agent_output.text".to_string()],
+                }),
+            },
+        ))
+    }
+
+    fn done_event(&self) -> ResponseEvent {
+        build_finished_event(api::response_event::stream_finished::Reason::Done(
+            api::response_event::stream_finished::Done {},
+        ))
     }
 }
 
@@ -359,20 +495,29 @@ fn truncate_for_log(s: &str, max: usize) -> &str {
     }
 }
 
-// ---- OpenAI response parsing -----------------------------------------------
+// ---- OpenAI response parsing (streaming) -----------------------------------
 
+/// Single SSE frame in OpenAI's `chat.completion.chunk` stream. We accept
+/// only the fields we need; missing/unknown fields are silently ignored
+/// (`#[serde(default)]`). This is intentionally permissive — local
+/// runtimes vary in which optional fields they include.
 #[derive(Debug, serde::Deserialize)]
-struct OpenAiChatResponse {
-    choices: Vec<OpenAiChoice>,
+struct OpenAiStreamChunk {
+    #[serde(default)]
+    choices: Vec<OpenAiStreamChoice>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct OpenAiChoice {
-    message: OpenAiResponseMessage,
+struct OpenAiStreamChoice {
+    #[serde(default)]
+    delta: OpenAiStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct OpenAiResponseMessage {
+#[derive(Debug, Default, serde::Deserialize)]
+struct OpenAiStreamDelta {
+    #[serde(default)]
     content: Option<String>,
 }
 
@@ -457,7 +602,7 @@ mod tests {
         );
         let req = translate_request(&request, &make_config()).expect("should translate");
         assert_eq!(req.model, "qwen2.5-coder:7b");
-        assert_eq!(req.stream, Some(false));
+        assert_eq!(req.stream, Some(true));
         let roles: Vec<_> = req.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
         assert_eq!(req.messages.last().unwrap().content.as_deref(), Some("what time is it?"));
@@ -521,14 +666,190 @@ mod tests {
     }
 
     #[test]
-    fn build_agent_output_message_carries_text() {
-        let m = build_agent_output_message("hello world".into(), "t".into(), "r".into());
-        assert_eq!(m.task_id, "t");
-        assert_eq!(m.request_id, "r");
-        assert!(m.timestamp.is_some());
-        match m.message {
-            Some(api::message::Message::AgentOutput(out)) => assert_eq!(out.text, "hello world"),
-            _ => panic!("expected agent output"),
+    fn parse_openai_stream_chunk_with_content() {
+        let raw = r#"{"id":"x","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}"#;
+        let chunk: OpenAiStreamChunk = serde_json::from_str(raw).unwrap();
+        assert_eq!(chunk.choices.len(), 1);
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hi"));
+        assert!(chunk.choices[0].finish_reason.is_none());
+    }
+
+    #[test]
+    fn parse_openai_stream_chunk_with_finish_reason() {
+        let raw = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        let chunk: OpenAiStreamChunk = serde_json::from_str(raw).unwrap();
+        assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(chunk.choices[0].delta.content.is_none());
+    }
+
+    #[test]
+    fn parse_openai_stream_chunk_tolerates_unknown_fields() {
+        // Some backends emit extra fields like `system_fingerprint`,
+        // `usage` mid-stream, etc. We must not bail on those.
+        let raw = r#"{"id":"x","object":"chat.completion.chunk","model":"m","system_fingerprint":"f","usage":{"prompt_tokens":1},"choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null,"logprobs":null}]}"#;
+        let chunk: OpenAiStreamChunk = serde_json::from_str(raw).unwrap();
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("!"));
+    }
+
+    #[test]
+    fn parse_openai_stream_chunk_empty_choices() {
+        // First chunk from some backends has no choices (just role
+        // metadata); we should accept and ignore.
+        let raw = r#"{"id":"x","choices":[]}"#;
+        let chunk: OpenAiStreamChunk = serde_json::from_str(raw).unwrap();
+        assert!(chunk.choices.is_empty());
+    }
+
+    /// Build a `StreamingState` whose eventsource won't be polled — used
+    /// only to exercise the synchronous helpers (`maybe_push_init`,
+    /// `maybe_push_placeholder`, `append_text_event`, `process_chunk`)
+    /// without needing a real HTTP fixture.
+    fn fake_streaming_state() -> StreamingState {
+        StreamingState {
+            // An empty stream is fine — we never poll it in these tests.
+            eventsource: futures::stream::empty().boxed(),
+            task_id: "task-1".into(),
+            request_id: "req-1".into(),
+            message_id: "msg-1".into(),
+            emitted_init: false,
+            emitted_placeholder: false,
+            finished: false,
+            pending_init: Some(ResponseEvent {
+                r#type: Some(api::response_event::Type::Init(
+                    api::response_event::StreamInit {
+                        request_id: "req-1".into(),
+                        conversation_id: "conv".into(),
+                        run_id: String::new(),
+                    },
+                )),
+            }),
         }
+    }
+
+    #[test]
+    fn process_chunk_emits_init_then_placeholder_then_append() {
+        let mut state = fake_streaming_state();
+        let chunk = OpenAiStreamChunk {
+            choices: vec![OpenAiStreamChoice {
+                delta: OpenAiStreamDelta {
+                    content: Some("Hello".into()),
+                },
+                finish_reason: None,
+            }],
+        };
+        let mut events = vec![];
+        state.process_chunk(chunk, &mut events);
+        assert_eq!(events.len(), 3, "init + placeholder + append");
+        assert!(matches!(
+            events[0].r#type,
+            Some(api::response_event::Type::Init(_))
+        ));
+        // Second event is the placeholder AddMessagesToTask.
+        let actions = match &events[1].r#type {
+            Some(api::response_event::Type::ClientActions(a)) => &a.actions,
+            _ => panic!("expected ClientActions"),
+        };
+        assert!(matches!(
+            actions[0].action,
+            Some(api::client_action::Action::AddMessagesToTask(_))
+        ));
+        // Third event is the AppendToMessageContent with our delta text.
+        let actions = match &events[2].r#type {
+            Some(api::response_event::Type::ClientActions(a)) => &a.actions,
+            _ => panic!("expected ClientActions"),
+        };
+        match &actions[0].action {
+            Some(api::client_action::Action::AppendToMessageContent(a)) => {
+                let mask = a.mask.as_ref().unwrap();
+                assert_eq!(mask.paths, vec!["message.agent_output.text".to_string()]);
+                let msg = a.message.as_ref().unwrap();
+                match &msg.message {
+                    Some(api::message::Message::AgentOutput(out)) => {
+                        assert_eq!(out.text, "Hello");
+                    }
+                    _ => panic!("expected agent output"),
+                }
+            }
+            _ => panic!("expected AppendToMessageContent"),
+        }
+    }
+
+    #[test]
+    fn process_chunk_subsequent_deltas_skip_init_and_placeholder() {
+        let mut state = fake_streaming_state();
+        // First chunk: emits init + placeholder + append
+        state.process_chunk(
+            OpenAiStreamChunk {
+                choices: vec![OpenAiStreamChoice {
+                    delta: OpenAiStreamDelta {
+                        content: Some("Hi".into()),
+                    },
+                    finish_reason: None,
+                }],
+            },
+            &mut vec![],
+        );
+        // Second chunk: just the append delta.
+        let mut events = vec![];
+        state.process_chunk(
+            OpenAiStreamChunk {
+                choices: vec![OpenAiStreamChoice {
+                    delta: OpenAiStreamDelta {
+                        content: Some(" there".into()),
+                    },
+                    finish_reason: None,
+                }],
+            },
+            &mut events,
+        );
+        assert_eq!(events.len(), 1, "only the append delta on subsequent chunk");
+    }
+
+    #[test]
+    fn process_chunk_finish_reason_emits_done() {
+        let mut state = fake_streaming_state();
+        let mut events = vec![];
+        state.process_chunk(
+            OpenAiStreamChunk {
+                choices: vec![OpenAiStreamChoice {
+                    delta: OpenAiStreamDelta { content: None },
+                    finish_reason: Some("stop".into()),
+                }],
+            },
+            &mut events,
+        );
+        // Init + empty placeholder + StreamFinished(Done) — even with no
+        // content, we keep the placeholder so the assistant turn renders.
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events.last().unwrap().r#type,
+            Some(api::response_event::Type::Finished(api::response_event::StreamFinished {
+                reason: Some(api::response_event::stream_finished::Reason::Done(_)),
+                ..
+            }))
+        ));
+        assert!(state.finished);
+    }
+
+    #[test]
+    fn process_chunk_finish_reason_length_emits_max_token_limit() {
+        let mut state = fake_streaming_state();
+        let mut events = vec![];
+        state.process_chunk(
+            OpenAiStreamChunk {
+                choices: vec![OpenAiStreamChoice {
+                    delta: OpenAiStreamDelta { content: None },
+                    finish_reason: Some("length".into()),
+                }],
+            },
+            &mut events,
+        );
+        assert!(matches!(
+            events.last().unwrap().r#type,
+            Some(api::response_event::Type::Finished(api::response_event::StreamFinished {
+                reason: Some(api::response_event::stream_finished::Reason::MaxTokenLimit(_)),
+                ..
+            }))
+        ));
     }
 }
