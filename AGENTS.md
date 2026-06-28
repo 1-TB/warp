@@ -192,3 +192,14 @@ if FeatureFlag::YourNewFeature.is_enabled() {
 ### Exhaustive Matching
 
 When adding/editing match statements, avoid using the wildcard _ when at all possible. Exhaustive matching is helpful for ensuring that all variants are handled, especially when adding new variants to enums in the future.
+
+## Cursor Cloud specific instructions
+
+This repo builds a single GUI desktop product: the **Warp** terminal client. On Linux/OSS it builds as the `warp-oss` binary. There is no local backend service to start — the client uses an embedded SQLite DB and talks to Warp's hosted cloud by default. Standard build/lint/test commands are already documented above and in `README.md` / `script/presubmit`; use those. The notes below are only the non-obvious cloud-environment caveats.
+
+- **The GUI and the `integration` crate's UI tests require an X display.** Run headless and they fail at startup with `XNotSupported(XOpenDisplayFailed)`. There is no GPU, so use software rendering.
+  - Manual GUI runs: the interactive desktop is on `DISPLAY=:1`. Launch with `DISPLAY=:1 cargo run --bin warp-oss --features gui,fast_dev` (or run the prebuilt `./target/debug/warp-oss`). Harmless `libEGL DRI3`/`XDG_RUNTIME_DIR` warnings are expected.
+  - Integration/UI tests: start a virtual display and point tests at it, e.g. `Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &` then `DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 cargo nextest run -p integration <filter>`.
+- **`fast_dev` enables login-free use** (`fast_dev = ["skip_login"]`). Use `--features fast_dev` to reach a usable terminal without a Warp account; the client is otherwise usable while logged out.
+- **Test expectations:** `cargo nextest run --no-fail-fast --workspace --exclude command-signatures-v2` passes its ~8k unit tests headless. The `shell_integration_tests::test_remote_server_*` / `test_ssh_*` tests require `gcloud auth` + remote infrastructure and fail without them (optional, per `script/linux/bootstrap`). A small number of snapshot-based UI tests can differ under software (lavapipe) rendering.
+- **Pre-configured environment gotchas** (already set up in the VM snapshot; only relevant if a future change breaks them): `cargo clippy` (presubmit) compiles `command-signatures-v2`, whose build script needs Yarn 4 via **Corepack** (`corepack enable`). Rust 1.92 defaults to the `rust-lld` linker, which does not search gcc's private lib dir, so a `/usr/lib/x86_64-linux-gnu/libstdc++.so` symlink is in place so C++-linking test targets (`warp_editor`, `voice_input`) link.
